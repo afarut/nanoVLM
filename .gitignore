@@ -30,3 +30,6 @@ eval_results*/
 /shards/*
 *.png
 plots*/
+
+expert_data/
+env/
