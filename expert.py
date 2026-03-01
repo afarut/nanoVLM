@@ -167,10 +167,37 @@ def main() -> None:
                     "env_name": env_name,
                     "episode": ep,
                     "step": step,
-                    "image": image_name,
+                    "images": f"{args.out_dir}/{image_name}",
                     "action_id": action_id,
                     "agent_pos": [cur_pos[0], cur_pos[1]],
                     "agent_dir": cur_dir,
+                    "texts": [
+                        {
+                            "user": f"""### Информация о текущем положении
+- Большую часть ты узнаешь из картинки
+- Твоё текущее направление: {cur_dir}
+	- 0: right
+	- 1: down
+	- 2: left
+	- 3: up
+### Твоя глобальная задача: 
+- Дойти до зеленого квадратика. 
+### Твоя локальная задача
+- Cделать один шаг в сторону глобальной задачи.
+	- 
+
+### Формат вывода:
+Ответ: Число
+- Число должно быть от 0 до 2 включительно
+- 0: Turn left
+- 1: Turn right
+- 2: Move forward
+- ВАЖНО: После "Ответ: " ОБЯЗАТЕЛЬНО ДОЛЖНО БЫТЬ ТОЛЬКО ОДНО ЧИСЛО
+Если ты все понял, ответь в какую сторону мне стоит двигаться, чтобы достичь своей цели?
+Ответ: """,
+                            "assistant": f"{action_id}"
+                        }
+                    ]
                 }
                 if args.nanovlm_compatible:
                     row["images"] = [image_name]
