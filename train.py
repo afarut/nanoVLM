@@ -140,7 +140,24 @@ def get_dataloaders(train_cfg, vlm_cfg):
                 print(f"Warning: Failed to load dataset shard '{dataset_name}' from '{train_cfg.train_dataset_path}'. Error: {e}")
                 continue
         try:
-            train_ds = load_dataset(train_cfg.train_dataset_path, dataset_name, streaming=train_cfg.stream_dataset, on_bad_files='warn')['train']
+            try:
+                train_ds = load_dataset(
+                    train_cfg.train_dataset_path,
+                    dataset_name,
+                    streaming=train_cfg.stream_dataset,
+                    on_bad_files="warn",
+                )["train"]
+            except Exception as e:
+                # Older datasets/parquet builders don't support `on_bad_files`.
+                # Retry without it for compatibility.
+                if "on_bad_files" in str(e):
+                    train_ds = load_dataset(
+                        train_cfg.train_dataset_path,
+                        dataset_name,
+                        streaming=train_cfg.stream_dataset,
+                    )["train"]
+                else:
+                    raise
             if train_cfg.stream_dataset:
                 next(iter(train_ds)) # Check if the dataset is loaded correctly
             else:
