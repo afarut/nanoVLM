@@ -64,8 +64,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-split", type=str, default="test")
     parser.add_argument("--train-episodes", type=int, default=1200)
     parser.add_argument("--eval-every", type=int, default=50)
-    parser.add_argument("--eval-rollout-episodes", type=int, default=40)
-    parser.add_argument("--rollout-log-every", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=48)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--gen-max-new-tokens", type=int, default=48)
@@ -345,119 +343,25 @@ def evaluate_on_test_dataset(
     }
 
 
-@torch.no_grad()
-def evaluate_rollout_policy(
-    model,
-    tokenizer,
-    image_processor,
-    env_id: str,
-    episode_size: int,
-    episodes: int,
-    max_steps: int,
-    tile_size: int,
-    seed: int,
-    invalid_action_fallback: int,
-    gen_max_new_tokens: int,
-    rollout_log_every: int,
-    device: torch.device,
-) -> dict[str, float]:
-    model.eval()
-    successes = []
-    returns = []
-    print(f"[rollout eval] start: episodes={episodes}, max_steps={max_steps}", flush=True)
-
-    for ep in range(episodes):
-        env = gym.make(env_id, render_mode="rgb_array", size=episode_size)
-        _, _ = env.reset(seed=seed + 100_000 + ep)
-        do_log = rollout_log_every > 0 and ((ep + 1) % rollout_log_every == 0 or ep == 0)
-        if do_log:
-            print(f"[rollout eval] episode {ep + 1}/{episodes} start", flush=True)
-
-        ep_return = 0.0
-        success = 0
-
-        for step_idx in range(max_steps):
-            input_ids, attention_mask, images = prepare_state_tensors(
-                model,
-                tokenizer,
-                image_processor,
-                env.unwrapped,
-                tile_size,
-                device,
-            )
-            if do_log and step_idx == 0:
-                print(f"[rollout eval] episode {ep + 1}: step 1 generate", flush=True)
-            generated = model.generate(
-                input_ids,
-                images,
-                attention_mask=attention_mask,
-                max_new_tokens=gen_max_new_tokens,
-                greedy=True,
-            )
-            generated_ids = generated[0]
-            output_text = tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
-            action = parse_action_from_text(output_text)
-            if action is None:
-                action = invalid_action_fallback
-            if do_log and step_idx == 0:
-                print(f"[rollout eval] episode {ep + 1}: step 1 action={action}", flush=True)
-
-            _, reward, terminated, truncated, _ = env.step(int(action))
-            ep_return += float(reward)
-            if terminated and reward > 0:
-                success = 1
-            if terminated or truncated:
-                break
-
-        env.close()
-        successes.append(success)
-        returns.append(ep_return)
-        if do_log:
-            print(
-                f"[rollout eval] episode {ep + 1}/{episodes} done: success={success}, return={ep_return:.3f}",
-                flush=True,
-            )
-
-    if not successes:
-        return {"success_rate": 0.0, "avg_return": 0.0}
-
-    out = {
-        "success_rate": float(np.mean(successes)),
-        "avg_return": float(np.mean(returns)),
-    }
-    print(
-        f"[rollout eval] done: success_rate={out['success_rate']:.3f}, avg_return={out['avg_return']:.3f}",
-        flush=True,
-    )
-    return out
-
-
 def save_plots(metrics: dict, out_path: Path) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    ax = axes.flatten()
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    ax[0].plot(metrics["train_loss"], lw=1.2)
-    ax[0].set_title("Train loss")
-    ax[0].set_xlabel("Episode")
+    axes[0].plot(metrics["train_loss"], lw=1.2)
+    axes[0].set_title("Train loss")
+    axes[0].set_xlabel("Episode")
 
-    ax[1].plot(metrics["eval_steps"], metrics["eval_test_ce_grpo"], label="GRPO text+action", lw=1.7)
-    ax[1].axhline(metrics["eval_test_ce_sft"], linestyle="--", label="SFT baseline", lw=1.7)
-    ax[1].set_title("Test CrossEntropyLoss")
-    ax[1].set_xlabel("Episode")
-    ax[1].legend()
+    axes[1].plot(metrics["eval_steps"], metrics["eval_test_ce_grpo"], label="GRPO text+action", lw=1.7)
+    axes[1].axhline(metrics["eval_test_ce_sft"], linestyle="--", label="SFT baseline", lw=1.7)
+    axes[1].set_title("Test CrossEntropyLoss")
+    axes[1].set_xlabel("Episode")
+    axes[1].legend()
 
-    ax[2].plot(metrics["eval_steps"], metrics["eval_rollout_success_grpo"], label="GRPO text+action", lw=1.7)
-    ax[2].axhline(metrics["eval_rollout_success_sft"], linestyle="--", label="SFT baseline", lw=1.7)
-    ax[2].set_title("Rollout success rate")
-    ax[2].set_xlabel("Episode")
-    ax[2].set_ylim(0.0, 1.0)
-    ax[2].legend()
-
-    ax[3].plot(metrics["eval_steps"], metrics["eval_rollout_return_grpo"], label="GRPO text+action", lw=1.7)
-    ax[3].axhline(metrics["eval_rollout_return_sft"], linestyle="--", label="SFT baseline", lw=1.7)
-    ax[3].set_title("Rollout average return")
-    ax[3].set_xlabel("Episode")
-    ax[3].legend()
+    axes[2].plot(metrics["eval_steps"], metrics["eval_best_traj_prob_grpo"], label="GRPO text+action", lw=1.7)
+    axes[2].axhline(metrics["eval_best_traj_prob_sft"], linestyle="--", label="SFT baseline", lw=1.7)
+    axes[2].set_title("Best Trajectory Probability (test)")
+    axes[2].set_xlabel("Episode")
+    axes[2].set_yscale("log")
+    axes[2].legend()
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -504,26 +408,9 @@ def main() -> None:
         action_token_ids,
         device,
     )
-    sft_rollout = evaluate_rollout_policy(
-        reference,
-        tokenizer,
-        image_processor,
-        args.env_id,
-        args.episode_size,
-        args.eval_rollout_episodes,
-        args.max_steps,
-        args.tile_size,
-        args.seed,
-        args.invalid_action_fallback,
-        args.gen_max_new_tokens,
-        args.rollout_log_every,
-        device,
-    )
     print(
         f"SFT baseline test: CE={sft_eval['test_ce']:.6f}, "
-        f"best_traj_prob={sft_eval['best_traj_prob']:.6e}, "
-        f"rollout_success={sft_rollout['success_rate']:.3f}, "
-        f"rollout_return={sft_rollout['avg_return']:.3f}"
+        f"best_traj_prob={sft_eval['best_traj_prob']:.6e}"
     )
 
     metrics = {
@@ -534,15 +421,10 @@ def main() -> None:
         "eval_test_ce_grpo": [],
         "eval_best_traj_prob_grpo": [],
         "eval_best_traj_logprob_grpo": [],
-        "eval_rollout_success_grpo": [],
-        "eval_rollout_return_grpo": [],
         "eval_test_ce_sft": sft_eval["test_ce"],
         "eval_best_traj_prob_sft": sft_eval["best_traj_prob"],
         "eval_best_traj_logprob_sft": sft_eval["best_traj_logprob"],
-        "eval_rollout_success_sft": sft_rollout["success_rate"],
-        "eval_rollout_return_sft": sft_rollout["avg_return"],
         "sft_eval": sft_eval,
-        "sft_rollout": sft_rollout,
     }
 
     pbar = trange(args.train_episodes, desc="GRPO text+action train", leave=True)
@@ -644,34 +526,15 @@ def main() -> None:
                 action_token_ids,
                 device,
             )
-            rollout_stats = evaluate_rollout_policy(
-                policy,
-                tokenizer,
-                image_processor,
-                args.env_id,
-                args.episode_size,
-                args.eval_rollout_episodes,
-                args.max_steps,
-                args.tile_size,
-                args.seed,
-                args.invalid_action_fallback,
-                args.gen_max_new_tokens,
-                args.rollout_log_every,
-                device,
-            )
 
             metrics["eval_steps"].append(ep + 1)
             metrics["eval_test_ce_grpo"].append(eval_stats["test_ce"])
             metrics["eval_best_traj_prob_grpo"].append(eval_stats["best_traj_prob"])
             metrics["eval_best_traj_logprob_grpo"].append(eval_stats["best_traj_logprob"])
-            metrics["eval_rollout_success_grpo"].append(rollout_stats["success_rate"])
-            metrics["eval_rollout_return_grpo"].append(rollout_stats["avg_return"])
 
             print(
                 f"[Eval @ {ep + 1}] test_CE={eval_stats['test_ce']:.6f}, "
-                f"best_traj_prob={eval_stats['best_traj_prob']:.6e}, "
-                f"rollout_success={rollout_stats['success_rate']:.3f}, "
-                f"rollout_return={rollout_stats['avg_return']:.3f}"
+                f"best_traj_prob={eval_stats['best_traj_prob']:.6e}"
             )
 
     model_dir = args.output_dir / "grpo_text_action_model"
