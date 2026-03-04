@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-episodes", type=int, default=1200)
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--eval-rollout-episodes", type=int, default=40)
+    parser.add_argument("--rollout-log-every", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=48)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--gen-max-new-tokens", type=int, default=48)
@@ -357,20 +358,25 @@ def evaluate_rollout_policy(
     seed: int,
     invalid_action_fallback: int,
     gen_max_new_tokens: int,
+    rollout_log_every: int,
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
     successes = []
     returns = []
+    print(f"[rollout eval] start: episodes={episodes}, max_steps={max_steps}", flush=True)
 
     for ep in range(episodes):
         env = gym.make(env_id, render_mode="rgb_array", size=episode_size)
         _, _ = env.reset(seed=seed + 100_000 + ep)
+        do_log = rollout_log_every > 0 and ((ep + 1) % rollout_log_every == 0 or ep == 0)
+        if do_log:
+            print(f"[rollout eval] episode {ep + 1}/{episodes} start", flush=True)
 
         ep_return = 0.0
         success = 0
 
-        for _ in range(max_steps):
+        for step_idx in range(max_steps):
             input_ids, attention_mask, images = prepare_state_tensors(
                 model,
                 tokenizer,
@@ -379,6 +385,8 @@ def evaluate_rollout_policy(
                 tile_size,
                 device,
             )
+            if do_log and step_idx == 0:
+                print(f"[rollout eval] episode {ep + 1}: step 1 generate", flush=True)
             generated = model.generate(
                 input_ids,
                 images,
@@ -391,6 +399,8 @@ def evaluate_rollout_policy(
             action = parse_action_from_text(output_text)
             if action is None:
                 action = invalid_action_fallback
+            if do_log and step_idx == 0:
+                print(f"[rollout eval] episode {ep + 1}: step 1 action={action}", flush=True)
 
             _, reward, terminated, truncated, _ = env.step(int(action))
             ep_return += float(reward)
@@ -402,14 +412,24 @@ def evaluate_rollout_policy(
         env.close()
         successes.append(success)
         returns.append(ep_return)
+        if do_log:
+            print(
+                f"[rollout eval] episode {ep + 1}/{episodes} done: success={success}, return={ep_return:.3f}",
+                flush=True,
+            )
 
     if not successes:
         return {"success_rate": 0.0, "avg_return": 0.0}
 
-    return {
+    out = {
         "success_rate": float(np.mean(successes)),
         "avg_return": float(np.mean(returns)),
     }
+    print(
+        f"[rollout eval] done: success_rate={out['success_rate']:.3f}, avg_return={out['avg_return']:.3f}",
+        flush=True,
+    )
+    return out
 
 
 def save_plots(metrics: dict, out_path: Path) -> None:
@@ -496,6 +516,7 @@ def main() -> None:
         args.seed,
         args.invalid_action_fallback,
         args.gen_max_new_tokens,
+        args.rollout_log_every,
         device,
     )
     print(
@@ -635,6 +656,7 @@ def main() -> None:
                 args.seed,
                 args.invalid_action_fallback,
                 args.gen_max_new_tokens,
+                args.rollout_log_every,
                 device,
             )
 
