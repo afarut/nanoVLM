@@ -260,7 +260,8 @@ def sequence_logprob(model, input_ids, attention_mask, images, generated_ids: to
 
     prompt_len = input_ids.size(1)
     gen_len = generated_ids.numel()
-    gen_ids = generated_ids.unsqueeze(0)
+    # `generate()` returns inference tensors; clone to use as gather indices in autograd path.
+    gen_ids = generated_ids.clone().unsqueeze(0)
     full_ids = torch.cat([input_ids, gen_ids], dim=1)
     full_mask = build_full_attention_mask(attention_mask, gen_len)
 
