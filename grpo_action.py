@@ -372,24 +372,7 @@ def main() -> None:
         done = False
         ep_return = 0.0
         ep_loss_values = []
-        success = 0
-
-        if (ep + 1) % args.eval_every == 0:
-            eval_stats = evaluate_on_test_dataset(
-                policy,
-                test_dataset,
-                test_rows,
-                action_token_ids,
-                device,
-            )
-            metrics["eval_steps"].append(ep + 1)
-            metrics["eval_test_ce_grpo"].append(eval_stats["test_ce"])
-            metrics["eval_best_traj_prob_grpo"].append(eval_stats["best_traj_prob"])
-            metrics["eval_best_traj_logprob_grpo"].append(eval_stats["best_traj_logprob"])
-            print(
-                f"[Eval @ {ep+1}] test_CE={eval_stats['test_ce']:.6f}, "
-                f"best_traj_prob={eval_stats['best_traj_prob']:.6e}"
-            )
+        success = 1
 
         for _ in range(args.max_steps):
             input_ids, attention_mask, images = prepare_state_tensors(
@@ -429,8 +412,6 @@ def main() -> None:
             action_exec = int(sampled_actions[0].item())
             _, reward, terminated, truncated, _ = env.step(action_exec)
             ep_return += float(reward)
-            if terminated and reward > 0:
-                success = 1
             if terminated or truncated:
                 done = True
                 break
@@ -440,6 +421,23 @@ def main() -> None:
         metrics["train_success"].append(success)
         metrics["train_return"].append(ep_return)
         pbar.set_postfix({"ret": f"{ep_return:.2f}"})
+
+        if (ep + 1) % args.eval_every == 0:
+            eval_stats = evaluate_on_test_dataset(
+                policy,
+                test_dataset,
+                test_rows,
+                action_token_ids,
+                device,
+            )
+            metrics["eval_steps"].append(ep + 1)
+            metrics["eval_test_ce_grpo"].append(eval_stats["test_ce"])
+            metrics["eval_best_traj_prob_grpo"].append(eval_stats["best_traj_prob"])
+            metrics["eval_best_traj_logprob_grpo"].append(eval_stats["best_traj_logprob"])
+            print(
+                f"[Eval @ {ep+1}] test_CE={eval_stats['test_ce']:.6f}, "
+                f"best_traj_prob={eval_stats['best_traj_prob']:.6e}"
+            )
 
         if done and success == 0 and ep_return == 0.0:
             pass
