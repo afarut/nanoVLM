@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""GRPO training for direct action prediction in MiniGrid EmptyEnv."""
+"""GRPO training for text-plan + action generation in MiniGrid EmptyEnv."""
 
 import argparse
 import copy
 import io
 import json
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -37,15 +38,21 @@ DEFAULT_PROMPT = """### Информация о текущем положени�
 ### Твоя локальная задача
 - Cделать один шаг в сторону глобальной задачи.
 
-### Формат вывода:
-Ответ: Число
+### Формат вывода (строго):
+План: 2-3 коротких предложения о том, где агент и куда лучше сделать следующий шаг.
+Действие: Число
 - Число должно быть от 0 до 2 включительно
 - 0: Turn left
 - 1: Turn right
 - 2: Move forward
-- ВАЖНО: После "Ответ: " ОБЯЗАТЕЛЬНО ДОЛЖНО БЫТЬ ТОЛЬКО ОДНО ЧИСЛО
-Если ты все понял, ответь в какую сторону мне стоит двигаться, чтобы достичь своей цели?
-Ответ: """
+- ВАЖНО: после строки "Действие:" должно быть только одно число.
+
+Сначала напиши "План:", потом "Действие:".
+"""
+
+
+ACTION_RE = re.compile(r"действие\s*:\s*([0-2])", re.IGNORECASE)
+ANY_ACTION_RE = re.compile(r"(?<!\d)([0-2])(?!\d)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,11 +63,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-split", type=str, default="test")
     parser.add_argument("--train-episodes", type=int, default=1200)
     parser.add_argument("--eval-every", type=int, default=50)
+    parser.add_argument("--eval-rollout-episodes", type=int, default=40)
     parser.add_argument("--max-steps", type=int, default=48)
     parser.add_argument("--group-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=3e-6)
+    parser.add_argument("--gen-max-new-tokens", type=int, default=48)
+    parser.add_argument("--gen-top-k", type=int, default=50)
+    parser.add_argument("--gen-top-p", type=float, default=0.9)
+    parser.add_argument("--gen-temperature", type=float, default=0.8)
+    parser.add_argument("--invalid-action-fallback", type=int, default=2, choices=[0, 1, 2])
+    parser.add_argument("--format-reward", type=float, default=0.10)
+    parser.add_argument("--action-parse-reward", type=float, default=0.10)
     parser.add_argument("--kl-coef", type=float, default=0.02)
     parser.add_argument("--shaping-coef", type=float, default=0.25)
+    parser.add_argument("--lr", type=float, default=3e-6)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--tile-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -158,9 +173,32 @@ def next_token_logits(model, input_ids, attention_mask, images):
     return logits.squeeze(0)
 
 
+def parse_action_from_text(text: str) -> int | None:
+    m = ACTION_RE.search(text)
+    if m:
+        return int(m.group(1))
+    m = ANY_ACTION_RE.search(text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def count_sentences(text: str) -> int:
+    pieces = [p.strip() for p in re.split(r"[.!?]+", text) if p.strip()]
+    return len(pieces)
+
+
+def format_bonus(text: str, action: int | None, format_reward: float, action_parse_reward: float) -> float:
+    bonus = 0.0
+    if "план" in text.lower() and 2 <= count_sentences(text) <= 5:
+        bonus += format_reward
+    if action is not None:
+        bonus += action_parse_reward
+    return bonus
+
+
 @torch.no_grad()
 def _prompt_tensors_from_row(
-    model,
     test_dataset: VQADataset,
     row: dict,
     device: torch.device,
@@ -183,7 +221,7 @@ def _prompt_tensors_from_row(
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    
+
     input_ids = torch.tensor(encoded, dtype=torch.long, device=device).unsqueeze(0)
     attention_mask = torch.ones_like(input_ids, device=device)
     images = [img.to(device) for img in processed_images]
@@ -207,6 +245,49 @@ def load_test_rows(dataset_name: str, split: str) -> list[dict]:
             raise ValueError("Unsupported image format in test dataset row.")
         rows.append(row)
     return rows
+
+
+def build_full_attention_mask(base_mask: torch.Tensor, extra_len: int) -> torch.Tensor:
+    if extra_len <= 0:
+        return base_mask
+    extra = torch.ones((base_mask.size(0), extra_len), dtype=base_mask.dtype, device=base_mask.device)
+    return torch.cat([base_mask, extra], dim=1)
+
+
+def sequence_logprob(model, input_ids, attention_mask, images, generated_ids: torch.Tensor) -> torch.Tensor:
+    if generated_ids.numel() == 0:
+        return torch.zeros((), device=input_ids.device)
+
+    prompt_len = input_ids.size(1)
+    gen_len = generated_ids.numel()
+    gen_ids = generated_ids.unsqueeze(0)
+    full_ids = torch.cat([input_ids, gen_ids], dim=1)
+    full_mask = build_full_attention_mask(attention_mask, gen_len)
+
+    logits, _ = model(input_ids=full_ids, images=images, attention_mask=full_mask)
+    if not model.decoder.lm_use_tokens:
+        logits = model.decoder.head(logits)
+
+    token_logits = logits[:, prompt_len - 1 : prompt_len - 1 + gen_len, :]
+    log_probs = F.log_softmax(token_logits, dim=-1)
+    selected = log_probs.gather(-1, gen_ids.unsqueeze(-1)).squeeze(-1)
+    return selected.sum()
+
+
+def one_step_shaped_reward(env, action: int, goal_pos: tuple[int, int], shaping_coef: float) -> float:
+    sim_env = copy.deepcopy(env)
+    sim_uenv = sim_env.unwrapped
+    before = manhattan((int(sim_uenv.agent_pos[0]), int(sim_uenv.agent_pos[1])), goal_pos)
+    _, env_reward, terminated, truncated, _ = sim_env.step(action)
+    after = manhattan((int(sim_uenv.agent_pos[0]), int(sim_uenv.agent_pos[1])), goal_pos)
+    sim_env.close()
+
+    shaped = float(env_reward) + shaping_coef * float(before - after)
+    if truncated:
+        shaped -= 0.1
+    if terminated and env_reward > 0:
+        shaped += 0.5
+    return shaped
 
 
 @torch.no_grad()
@@ -236,7 +317,6 @@ def evaluate_on_test_dataset(
         ce_losses.append(float(ce_loss.item()))
 
         input_ids, attention_mask, images = _prompt_tensors_from_row(
-            model=model,
             test_dataset=test_dataset,
             row=row,
             device=device,
@@ -263,41 +343,99 @@ def evaluate_on_test_dataset(
     }
 
 
-def one_step_shaped_reward(env, action: int, goal_pos: tuple[int, int], shaping_coef: float) -> float:
-    sim_env = copy.deepcopy(env)
-    sim_uenv = sim_env.unwrapped
-    before = manhattan((int(sim_uenv.agent_pos[0]), int(sim_uenv.agent_pos[1])), goal_pos)
-    _, env_reward, terminated, truncated, _ = sim_env.step(action)
-    after = manhattan((int(sim_uenv.agent_pos[0]), int(sim_uenv.agent_pos[1])), goal_pos)
-    sim_env.close()
+@torch.no_grad()
+def evaluate_rollout_policy(
+    model,
+    tokenizer,
+    image_processor,
+    env_id: str,
+    episodes: int,
+    max_steps: int,
+    tile_size: int,
+    seed: int,
+    invalid_action_fallback: int,
+    gen_max_new_tokens: int,
+    device: torch.device,
+) -> dict[str, float]:
+    model.eval()
+    successes = []
+    returns = []
 
-    shaped = float(env_reward) + shaping_coef * float(before - after)
-    if truncated:
-        shaped -= 0.1
-    if terminated and env_reward > 0:
-        shaped += 0.5
-    return shaped
+    for ep in range(episodes):
+        env = gym.make(env_id, render_mode="rgb_array")
+        _, _ = env.reset(seed=seed + 100_000 + ep)
+
+        ep_return = 0.0
+        success = 0
+
+        for _ in range(max_steps):
+            input_ids, attention_mask, images = prepare_state_tensors(
+                model,
+                tokenizer,
+                image_processor,
+                env.unwrapped,
+                tile_size,
+                device,
+            )
+            generated = model.generate(
+                input_ids,
+                images,
+                attention_mask=attention_mask,
+                max_new_tokens=gen_max_new_tokens,
+                greedy=True,
+            )
+            generated_ids = generated[0]
+            output_text = tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
+            action = parse_action_from_text(output_text)
+            if action is None:
+                action = invalid_action_fallback
+
+            _, reward, terminated, truncated, _ = env.step(int(action))
+            ep_return += float(reward)
+            if terminated and reward > 0:
+                success = 1
+            if terminated or truncated:
+                break
+
+        env.close()
+        successes.append(success)
+        returns.append(ep_return)
+
+    if not successes:
+        return {"success_rate": 0.0, "avg_return": 0.0}
+
+    return {
+        "success_rate": float(np.mean(successes)),
+        "avg_return": float(np.mean(returns)),
+    }
 
 
 def save_plots(metrics: dict, out_path: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    ax = axes.flatten()
 
-    axes[0].plot(metrics["train_loss"], lw=1.2)
-    axes[0].set_title("Train loss")
-    axes[0].set_xlabel("Episode")
+    ax[0].plot(metrics["train_loss"], lw=1.2)
+    ax[0].set_title("Train loss")
+    ax[0].set_xlabel("Episode")
 
-    axes[1].plot(metrics["eval_steps"], metrics["eval_test_ce_grpo"], label="GRPO", lw=1.7)
-    axes[1].axhline(metrics["eval_test_ce_sft"], linestyle="--", label="SFT baseline", lw=1.7)
-    axes[1].set_title("Test CrossEntropyLoss")
-    axes[1].set_xlabel("Episode")
-    axes[1].legend()
+    ax[1].plot(metrics["eval_steps"], metrics["eval_test_ce_grpo"], label="GRPO text+action", lw=1.7)
+    ax[1].axhline(metrics["eval_test_ce_sft"], linestyle="--", label="SFT baseline", lw=1.7)
+    ax[1].set_title("Test CrossEntropyLoss")
+    ax[1].set_xlabel("Episode")
+    ax[1].legend()
 
-    axes[2].plot(metrics["eval_steps"], metrics["eval_best_traj_prob_grpo"], label="GRPO", lw=1.7)
-    axes[2].axhline(metrics["eval_best_traj_prob_sft"], linestyle="--", label="SFT baseline", lw=1.7)
-    axes[2].set_title("Best Trajectory Probability (test)")
-    axes[2].set_xlabel("Episode")
-    axes[2].set_yscale("log")
-    axes[2].legend()
+    ax[2].plot(metrics["eval_steps"], metrics["eval_rollout_success_grpo"], label="GRPO text+action", lw=1.7)
+    ax[2].axhline(metrics["eval_rollout_success_sft"], linestyle="--", label="SFT baseline", lw=1.7)
+    ax[2].set_title("Rollout success rate")
+    ax[2].set_xlabel("Episode")
+    ax[2].set_ylim(0.0, 1.0)
+    ax[2].legend()
+
+    ax[3].plot(metrics["eval_steps"], metrics["eval_rollout_return_grpo"], label="GRPO text+action", lw=1.7)
+    ax[3].axhline(metrics["eval_rollout_return_sft"], linestyle="--", label="SFT baseline", lw=1.7)
+    ax[3].set_title("Rollout average return")
+    ax[3].set_xlabel("Episode")
+    ax[3].legend()
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -324,6 +462,7 @@ def main() -> None:
         policy.cfg.vit_img_size,
         getattr(policy.cfg, "resize_to_max_side_len", False),
     )
+
     action_token_ids = resolve_action_token_ids(tokenizer)
     test_rows = load_test_rows(args.test_dataset, args.test_split)
     test_dataset = VQADataset(
@@ -343,9 +482,24 @@ def main() -> None:
         action_token_ids,
         device,
     )
+    sft_rollout = evaluate_rollout_policy(
+        reference,
+        tokenizer,
+        image_processor,
+        args.env_id,
+        args.eval_rollout_episodes,
+        args.max_steps,
+        args.tile_size,
+        args.seed,
+        args.invalid_action_fallback,
+        args.gen_max_new_tokens,
+        device,
+    )
     print(
         f"SFT baseline test: CE={sft_eval['test_ce']:.6f}, "
-        f"best_traj_prob={sft_eval['best_traj_prob']:.6e}"
+        f"best_traj_prob={sft_eval['best_traj_prob']:.6e}, "
+        f"rollout_success={sft_rollout['success_rate']:.3f}, "
+        f"rollout_return={sft_rollout['avg_return']:.3f}"
     )
 
     metrics = {
@@ -356,65 +510,80 @@ def main() -> None:
         "eval_test_ce_grpo": [],
         "eval_best_traj_prob_grpo": [],
         "eval_best_traj_logprob_grpo": [],
+        "eval_rollout_success_grpo": [],
+        "eval_rollout_return_grpo": [],
         "eval_test_ce_sft": sft_eval["test_ce"],
         "eval_best_traj_prob_sft": sft_eval["best_traj_prob"],
         "eval_best_traj_logprob_sft": sft_eval["best_traj_logprob"],
+        "eval_rollout_success_sft": sft_rollout["success_rate"],
+        "eval_rollout_return_sft": sft_rollout["avg_return"],
         "sft_eval": sft_eval,
+        "sft_rollout": sft_rollout,
     }
 
-    pbar = trange(args.train_episodes, desc="GRPO train", leave=True)
+    pbar = trange(args.train_episodes, desc="GRPO text+action train", leave=True)
     for ep in pbar:
         policy.train()
         env = gym.make(args.env_id, render_mode="rgb_array")
         _, _ = env.reset(seed=args.seed + ep)
         goal_pos = find_goal_pos(env)
 
-        done = False
         ep_return = 0.0
         ep_loss_values = []
         success = 0
 
-        if (ep + 1) % args.eval_every == 0:
-            eval_stats = evaluate_on_test_dataset(
-                policy,
-                test_dataset,
-                test_rows,
-                action_token_ids,
-                device,
-            )
-            metrics["eval_steps"].append(ep + 1)
-            metrics["eval_test_ce_grpo"].append(eval_stats["test_ce"])
-            metrics["eval_best_traj_prob_grpo"].append(eval_stats["best_traj_prob"])
-            metrics["eval_best_traj_logprob_grpo"].append(eval_stats["best_traj_logprob"])
-            print(
-                f"[Eval @ {ep+1}] test_CE={eval_stats['test_ce']:.6f}, "
-                f"best_traj_prob={eval_stats['best_traj_prob']:.6e}"
-            )
-
         for _ in range(args.max_steps):
             input_ids, attention_mask, images = prepare_state_tensors(
-                policy, tokenizer, image_processor, env.unwrapped, args.tile_size, device
+                policy,
+                tokenizer,
+                image_processor,
+                env.unwrapped,
+                args.tile_size,
+                device,
             )
-            policy_logits = next_token_logits(policy, input_ids, attention_mask, images)
-            with torch.no_grad():
-                ref_logits = next_token_logits(reference, input_ids, attention_mask, images)
 
-            action_logits = policy_logits[action_token_ids]
-            ref_action_logits = ref_logits[action_token_ids]
-            dist = torch.distributions.Categorical(logits=action_logits)
-            sampled_actions = dist.sample((args.group_size,))
+            sampled_rewards = []
+            sampled_log_probs = []
+            sampled_ref_log_probs = []
+            sampled_actions = []
 
-            rewards = []
-            for a in sampled_actions.tolist():
-                rewards.append(one_step_shaped_reward(env, int(a), goal_pos, args.shaping_coef))
-            rewards_t = torch.tensor(rewards, device=device, dtype=torch.float32)
+            for _g in range(args.group_size):
+                generated = policy.generate(
+                    input_ids,
+                    images,
+                    attention_mask=attention_mask,
+                    max_new_tokens=args.gen_max_new_tokens,
+                    top_k=args.gen_top_k,
+                    top_p=args.gen_top_p,
+                    temperature=args.gen_temperature,
+                    greedy=False,
+                )
+                generated_ids = generated[0]
+                output_text = tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
+                action = parse_action_from_text(output_text)
+
+                if action is None:
+                    action_for_reward = random.randint(0, 2)
+                else:
+                    action_for_reward = int(action)
+
+                reward = one_step_shaped_reward(env, action_for_reward, goal_pos, args.shaping_coef)
+                reward += format_bonus(output_text, action, args.format_reward, args.action_parse_reward)
+
+                seq_log_prob = sequence_logprob(policy, input_ids, attention_mask, images, generated_ids)
+                with torch.no_grad():
+                    seq_ref_log_prob = sequence_logprob(reference, input_ids, attention_mask, images, generated_ids)
+
+                sampled_rewards.append(reward)
+                sampled_log_probs.append(seq_log_prob)
+                sampled_ref_log_probs.append(seq_ref_log_prob)
+                sampled_actions.append(action)
+
+            rewards_t = torch.tensor(sampled_rewards, dtype=torch.float32, device=device)
             advantages = (rewards_t - rewards_t.mean()) / (rewards_t.std(unbiased=False) + 1e-6)
 
-            log_probs = F.log_softmax(action_logits, dim=-1)
-            ref_log_probs = F.log_softmax(ref_action_logits, dim=-1)
-            sel_log_probs = log_probs[sampled_actions]
-            with torch.no_grad():
-                sel_ref_log_probs = ref_log_probs[sampled_actions]
+            sel_log_probs = torch.stack(sampled_log_probs)
+            sel_ref_log_probs = torch.stack(sampled_ref_log_probs).detach()
 
             loss_pg = -(advantages.detach() * sel_log_probs).mean()
             loss_kl = (sel_log_probs - sel_ref_log_probs).mean()
@@ -426,36 +595,71 @@ def main() -> None:
             optimizer.step()
             ep_loss_values.append(float(loss.item()))
 
-            action_exec = int(sampled_actions[0].item())
-            _, reward, terminated, truncated, _ = env.step(action_exec)
+            action_exec = sampled_actions[0]
+            if action_exec is None:
+                action_exec = args.invalid_action_fallback
+
+            _, reward, terminated, truncated, _ = env.step(int(action_exec))
             ep_return += float(reward)
             if terminated and reward > 0:
                 success = 1
             if terminated or truncated:
-                done = True
                 break
 
         env.close()
         metrics["train_loss"].append(float(np.mean(ep_loss_values)) if ep_loss_values else 0.0)
         metrics["train_success"].append(success)
         metrics["train_return"].append(ep_return)
-        pbar.set_postfix({"ret": f"{ep_return:.2f}"})
+        pbar.set_postfix({"success": success, "ret": f"{ep_return:.2f}"})
 
-        if done and success == 0 and ep_return == 0.0:
-            pass
+        if (ep + 1) % args.eval_every == 0:
+            eval_stats = evaluate_on_test_dataset(
+                policy,
+                test_dataset,
+                test_rows,
+                action_token_ids,
+                device,
+            )
+            rollout_stats = evaluate_rollout_policy(
+                policy,
+                tokenizer,
+                image_processor,
+                args.env_id,
+                args.eval_rollout_episodes,
+                args.max_steps,
+                args.tile_size,
+                args.seed,
+                args.invalid_action_fallback,
+                args.gen_max_new_tokens,
+                device,
+            )
 
-    model_dir = args.output_dir / "grpo_model"
+            metrics["eval_steps"].append(ep + 1)
+            metrics["eval_test_ce_grpo"].append(eval_stats["test_ce"])
+            metrics["eval_best_traj_prob_grpo"].append(eval_stats["best_traj_prob"])
+            metrics["eval_best_traj_logprob_grpo"].append(eval_stats["best_traj_logprob"])
+            metrics["eval_rollout_success_grpo"].append(rollout_stats["success_rate"])
+            metrics["eval_rollout_return_grpo"].append(rollout_stats["avg_return"])
+
+            print(
+                f"[Eval @ {ep + 1}] test_CE={eval_stats['test_ce']:.6f}, "
+                f"best_traj_prob={eval_stats['best_traj_prob']:.6e}, "
+                f"rollout_success={rollout_stats['success_rate']:.3f}, "
+                f"rollout_return={rollout_stats['avg_return']:.3f}"
+            )
+
+    model_dir = args.output_dir / "grpo_text_action_model"
     model_dir.mkdir(parents=True, exist_ok=True)
     policy.save_pretrained(str(model_dir))
 
-    plot_path = args.output_dir / "grpo_learning_curves.png"
+    plot_path = args.output_dir / "grpo_text_action_learning_curves.png"
     save_plots(metrics, plot_path)
 
-    metrics_path = args.output_dir / "metrics.json"
+    metrics_path = args.output_dir / "metrics_text_action.json"
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    print(f"Saved GRPO model to: {model_dir}")
+    print(f"Saved GRPO text+action model to: {model_dir}")
     print(f"Saved metrics to: {metrics_path}")
     print(f"Saved plot to: {plot_path}")
 
