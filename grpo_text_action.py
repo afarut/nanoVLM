@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sft-model", type=str, default="Afarut/nanoVLM-sft")
     parser.add_argument("--env-id", type=str, default="MiniGrid-Empty-Random-6x6-v0")
+    parser.add_argument("--episode-size", type=int, default=15)
     parser.add_argument("--test-dataset", type=str, default="Afarut/NanoVLMEmptyEnv")
     parser.add_argument("--test-split", type=str, default="test")
     parser.add_argument("--train-episodes", type=int, default=1200)
@@ -349,6 +350,7 @@ def evaluate_rollout_policy(
     tokenizer,
     image_processor,
     env_id: str,
+    episode_size: int,
     episodes: int,
     max_steps: int,
     tile_size: int,
@@ -362,7 +364,7 @@ def evaluate_rollout_policy(
     returns = []
 
     for ep in range(episodes):
-        env = gym.make(env_id, render_mode="rgb_array")
+        env = gym.make(env_id, render_mode="rgb_array", size=episode_size)
         _, _ = env.reset(seed=seed + 100_000 + ep)
 
         ep_return = 0.0
@@ -487,6 +489,7 @@ def main() -> None:
         tokenizer,
         image_processor,
         args.env_id,
+        args.episode_size,
         args.eval_rollout_episodes,
         args.max_steps,
         args.tile_size,
@@ -524,7 +527,7 @@ def main() -> None:
     pbar = trange(args.train_episodes, desc="GRPO text+action train", leave=True)
     for ep in pbar:
         policy.train()
-        env = gym.make(args.env_id, render_mode="rgb_array")
+        env = gym.make(args.env_id, render_mode="rgb_array", size=args.episode_size)
         _, _ = env.reset(seed=args.seed + ep)
         goal_pos = find_goal_pos(env)
 
@@ -625,6 +628,7 @@ def main() -> None:
                 tokenizer,
                 image_processor,
                 args.env_id,
+                args.episode_size,
                 args.eval_rollout_episodes,
                 args.max_steps,
                 args.tile_size,
